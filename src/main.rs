@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use iced::clipboard;
-use iced::widget::{center_x, center_y};
 use iced::{
     Task, Widget,
     alignment::Horizontal,
@@ -9,25 +7,25 @@ use iced::{
 };
 use iced_core::text::Wrapping;
 use iroh::{Endpoint, endpoint::presets, protocol::Router};
-use iroh_ping::Ping;
+use iroh_ping::{ALPN, Ping};
 use iroh_tickets::endpoint::EndpointTicket;
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
 
-    let app = iced::application(
+    iced::application(
         || {
-            let task = Task::perform(run_receiver(), |res| {
-                Message::ReceiverStarted(res.map_err(|e| e.to_string()))
-            });
-
-            (IcedIrohApp::default(), task)
+            (
+                IcedIrohApp::default(),
+                Task::perform(run_receiver(), |res| {
+                    Message::ReceiverStarted(res.map_err(|e| e.to_string()))
+                }),
+            )
         },
         IcedIrohApp::update,
         IcedIrohApp::view,
-    );
-
-    app.run()
+    )
+    .run()
 }
 
 #[derive(Default)]
@@ -57,13 +55,13 @@ impl IcedIrohApp {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::ReceiverStarted(res) => {
-                match res {
+                self.state = match res {
                     Ok(router) => {
                         let ticket = EndpointTicket::new(router.endpoint().addr());
-                        self.state = State::Ready(router.clone(), format!("{ticket}"));
+                        State::Ready(router, ticket.to_string())
                     }
-                    Err(err) => self.state = State::Error(err),
-                }
+                    Err(err) => State::Error(err),
+                };
 
                 Task::none()
             }
@@ -90,26 +88,20 @@ impl IcedIrohApp {
 
     fn view(&self) -> impl Widget<Message> {
         let body = match &self.state {
-            State::Ready(_, ticket) => {
-                let copy_button = button("Copy").on_press(Message::CopyTicket);
-
-                let tooltip = match self.ticket_copied {
-                    true => Tooltip::new(copy_button, text("Copied")),
-                    false => Tooltip::new(copy_button, text("Copy")),
-                };
-
-                column![
-                    text("My Ticket"),
-                    text(ticket)
-                        .width(480)
-                        .height(96)
-                        .wrapping(Wrapping::WordOrGlyph),
-                    tooltip
-                ]
-                .spacing(4)
-                .align_x(Horizontal::Center)
-                .boxed()
-            }
+            State::Ready(_, ticket) => column![
+                text("My Ticket"),
+                text(ticket)
+                    .width(480)
+                    .height(96)
+                    .wrapping(Wrapping::WordOrGlyph),
+                Tooltip::new(
+                    button("Copy").on_press(Message::CopyTicket),
+                    text(if self.ticket_copied { "Copied" } else { "Copy" }),
+                )
+            ]
+            .spacing(4)
+            .align_x(Horizontal::Center)
+            .boxed(),
             State::Error(err) => text(format!("error: {err}")).boxed(),
             State::Loading => text("Starting receiver...").boxed(),
         };
