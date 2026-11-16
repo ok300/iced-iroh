@@ -1,14 +1,15 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use iced::{
     Task, Widget,
     alignment::Horizontal,
-    widget::{button, column, text, tooltip::Tooltip},
+    clipboard,
+    widget::{button, center_x, center_y, column, space, text, text_input, tooltip::Tooltip},
 };
 use iced_core::text::Wrapping;
 use iroh::{Endpoint, endpoint::presets, protocol::Router};
-use iroh_ping::{ALPN, Ping};
-use iroh_tickets::endpoint::EndpointTicket;
+use iroh_ping::Ping;
+use iroh_tickets::{Ticket, endpoint::EndpointTicket};
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt::init();
@@ -18,7 +19,7 @@ fn main() -> iced::Result {
             (
                 IcedIrohApp::default(),
                 Task::perform(run_receiver(), |res| {
-                    Message::ReceiverStarted(res.map_err(|e| e.to_string()))
+                    ReceiverMessage::ReceiverStarted(res.map_err(|e| e.to_string())).into()
                 }),
             )
         },
@@ -30,56 +31,106 @@ fn main() -> iced::Result {
 
 #[derive(Default)]
 struct IcedIrohApp {
-    state: State,
+    receiver_state: ReceiverState,
     ticket_copied: bool,
+    sender_input: String,
+    pong_output: String,
 }
 
 #[derive(Default)]
-enum State {
+enum ReceiverState {
     #[default]
     Loading,
-    // Keep the router alive so the receiver keeps running; only its ticket string is shown.
-    #[allow(dead_code)]
+    // Keep the router alive so the receiver keeps running.
     Ready(Arc<Router>, String),
     Error(String),
 }
 
-#[derive(Clone)]
+#[derive(Clone, derive_more::From)]
 enum Message {
+    Sender(SenderMessage),
+    Receiver(ReceiverMessage),
+}
+
+#[derive(Clone)]
+enum ReceiverMessage {
     ReceiverStarted(Result<Arc<Router>, String>),
     CopyTicket,
     TicketCopied(Result<(), String>),
 }
 
+#[derive(Clone)]
+enum SenderMessage {
+    InputChanged(String),
+    SendClicked,
+    PongReceived(Result<Duration, String>),
+}
+
 impl IcedIrohApp {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::ReceiverStarted(res) => {
-                self.state = match res {
+            Message::Receiver(ReceiverMessage::ReceiverStarted(res)) => {
+                self.receiver_state = match res {
                     Ok(router) => {
                         let ticket = EndpointTicket::new(router.endpoint().addr());
-                        State::Ready(router, ticket.to_string())
+                        ReceiverState::Ready(router, ticket.to_string())
                     }
-                    Err(err) => State::Error(err),
+                    Err(err) => ReceiverState::Error(err),
                 };
 
                 Task::none()
             }
-            Message::CopyTicket => {
-                let ticket = match &self.state {
-                    State::Ready(_, ticket) => ticket.clone(),
+
+            Message::Receiver(ReceiverMessage::CopyTicket) => {
+                let ticket = match &self.receiver_state {
+                    ReceiverState::Ready(_, ticket) => ticket.clone(),
                     _ => String::new(),
                 };
 
                 clipboard::write(ticket).map(|result| {
-                    Message::TicketCopied(match result {
+                    Message::Receiver(ReceiverMessage::TicketCopied(match result {
                         Ok(()) => Ok(()),
                         Err(e) => Err(format!("{e:?}")),
-                    })
+                    }))
                 })
             }
-            Message::TicketCopied(res) => {
+
+            Message::Receiver(ReceiverMessage::TicketCopied(res)) => {
                 self.ticket_copied = res.is_ok();
+
+                Task::none()
+            }
+
+            Message::Sender(SenderMessage::InputChanged(text)) => {
+                self.sender_input = text;
+
+                Task::none()
+            }
+
+            Message::Sender(SenderMessage::SendClicked) => {
+                let ticket_str = self.sender_input.clone();
+
+                let ticket = EndpointTicket::decode_string(&ticket_str)
+                    .map_err(|e| anyhow::anyhow!("failed to parse ticket: {}", e))
+                    .unwrap();
+
+                match &self.receiver_state {
+                    ReceiverState::Ready(router, _) => {
+                        let send_ep = router.endpoint().clone();
+
+                        Task::perform(run_sender(send_ep, ticket), |res| {
+                            SenderMessage::PongReceived(res.map_err(|e| e.to_string())).into()
+                        })
+                    }
+                    _ => Task::none(),
+                }
+            }
+
+            Message::Sender(SenderMessage::PongReceived(res)) => {
+                self.pong_output = match res {
+                    Ok(rtt) => format!("ping took: {:?} to complete", rtt),
+                    Err(err) => format!("err: {err}"),
+                };
 
                 Task::none()
             }
@@ -87,26 +138,38 @@ impl IcedIrohApp {
     }
 
     fn view(&self) -> impl Widget<Message> {
-        let body = match &self.state {
-            State::Ready(_, ticket) => column![
+        let body_receiver = match &self.receiver_state {
+            ReceiverState::Ready(_, ticket) => column![
                 text("My Ticket"),
-                text(ticket)
-                    .width(480)
-                    .height(96)
-                    .wrapping(Wrapping::WordOrGlyph),
+                text(ticket).width(480).wrapping(Wrapping::WordOrGlyph),
                 Tooltip::new(
-                    button("Copy").on_press(Message::CopyTicket),
+                    button("Copy").on_press(ReceiverMessage::CopyTicket.into()),
                     text(if self.ticket_copied { "Copied" } else { "Copy" }),
-                )
+                ),
             ]
             .spacing(4)
             .align_x(Horizontal::Center)
             .boxed(),
-            State::Error(err) => text(format!("error: {err}")).boxed(),
-            State::Loading => text("Starting receiver...").boxed(),
+            ReceiverState::Error(err) => text(format!("error: {err}")).boxed(),
+            ReceiverState::Loading => text("Starting receiver...").boxed(),
         };
 
-        center_y(center_x(body))
+        if matches!(self.receiver_state, ReceiverState::Ready(_, _)) {
+            let body_sender = column![
+                text_input("Enter ticket", &self.sender_input)
+                    .on_input(|text| SenderMessage::InputChanged(text).into())
+                    .multiline(Some(Wrapping::WordOrGlyph))
+                    .width(480),
+                button("Send").on_press(SenderMessage::SendClicked.into()),
+                text(&self.pong_output)
+            ]
+            .spacing(4)
+            .align_x(Horizontal::Center);
+
+            center_y(center_x(column![body_receiver, body_sender].spacing(4)))
+        } else {
+            center_y(center_x(column![body_receiver]))
+        }
     }
 }
 
@@ -120,4 +183,10 @@ async fn run_receiver() -> anyhow::Result<Arc<Router>> {
         .spawn();
 
     Ok(Arc::new(router))
+}
+
+async fn run_sender(own_endpoint: Endpoint, ticket: EndpointTicket) -> anyhow::Result<Duration> {
+    Ping::new()
+        .ping(&own_endpoint, ticket.endpoint_addr().clone())
+        .await
 }
