@@ -4,7 +4,7 @@ use iced::{
     Task, Widget,
     alignment::Horizontal,
     clipboard,
-    widget::{button, center_x, center_y, column, text, text_input, tooltip::Tooltip},
+    widget::{button, center_x, center_y, column, text, text_input},
 };
 use iced_core::text::Wrapping;
 use iroh::{Endpoint, endpoint::presets, protocol::Router};
@@ -142,12 +142,10 @@ impl IcedIrohApp {
             ReceiverState::Ready(_, ticket) => column![
                 text("My Ticket"),
                 text(ticket).width(480).wrapping(Wrapping::WordOrGlyph),
-                Tooltip::new(
-                    button("Copy").on_press(ReceiverMessage::CopyTicket.into()),
-                    text(if self.ticket_copied { "Copied" } else { "Copy" }),
-                ),
+                button(if self.ticket_copied { "Copied" } else { "Copy" })
+                    .on_press(ReceiverMessage::CopyTicket.into()),
             ]
-            .spacing(4)
+            .spacing(10)
             .align_x(Horizontal::Center)
             .boxed(),
             ReceiverState::Error(err) => text(format!("error: {err}")).boxed(),
@@ -163,10 +161,10 @@ impl IcedIrohApp {
                 button("Send").on_press(SenderMessage::SendClicked.into()),
                 text(&self.pong_output)
             ]
-            .spacing(4)
+            .spacing(10)
             .align_x(Horizontal::Center);
 
-            center_y(center_x(column![body_receiver, body_sender].spacing(4)))
+            center_y(center_x(column![body_receiver, body_sender].spacing(10)))
         } else {
             center_y(center_x(column![body_receiver]))
         }
