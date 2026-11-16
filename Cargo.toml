@@ -11,5 +11,4 @@ iced_core = { git = "https://github.com/iced-rs/iced", rev = "23b303cb3fe5285501
 iroh = "1.4.1"
 iroh-ping = "1.0.0"
 iroh-tickets = "1.0.0"
-tokio = { version = "1.54.1", features = ["full"] }
 tracing-subscriber = "0.3.23"
