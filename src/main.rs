@@ -4,7 +4,7 @@ use iced::{
     Task, Widget,
     alignment::Horizontal,
     clipboard,
-    widget::{button, center_x, center_y, column, space, text, text_input, tooltip::Tooltip},
+    widget::{button, center_x, center_y, column, text, text_input, tooltip::Tooltip},
 };
 use iced_core::text::Wrapping;
 use iroh::{Endpoint, endpoint::presets, protocol::Router};
