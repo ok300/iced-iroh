@@ -1,0 +1,9 @@
+# Complexity
+excessive-nesting-threshold = 4
+too-many-arguments-threshold = 6
+
+# Pedantic
+max-fn-params-bools = 2
+max-struct-bools = 2
+single-char-binding-names-threshold = 1
+too-many-lines-threshold = 60
