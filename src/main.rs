@@ -1,10 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
 use iced::{
-    Element, Task, Widget,
+    Color, Element, Length, Task, Theme, Widget,
     alignment::Horizontal,
     clipboard,
-    widget::{button, center_x, center_y, column, text, text_input},
+    widget::{button, center_x, center_y, column, container, radio, row, text, text_input},
 };
 use iced_core::text::Wrapping;
 use iroh::{Endpoint, endpoint::presets, protocol::Router};
@@ -17,7 +17,10 @@ fn main() -> iced::Result {
     iced::application(
         || {
             (
-                IcedIrohApp::default(),
+                IcedIrohApp {
+                    sidebar_selected: Some(0),
+                    ..Default::default()
+                },
                 Task::perform(run_receiver(), |res| {
                     ReceiverMessage::ReceiverStarted(res.map_err(|e| e.to_string())).into()
                 }),
@@ -35,6 +38,8 @@ struct IcedIrohApp {
     ticket_copied: bool,
     sender_input: String,
     pong_output: String,
+    sidebar_selected: Option<usize>,
+    peers: Vec<EndpointTicket>,
 }
 
 #[derive(Default)]
@@ -50,6 +55,7 @@ enum ReceiverState {
 enum Message {
     Sender(SenderMessage),
     Receiver(ReceiverMessage),
+    SidebarRowSelected(usize),
 }
 
 #[derive(Clone)]
@@ -63,7 +69,9 @@ enum ReceiverMessage {
 enum SenderMessage {
     InputChanged(String),
     SendClicked,
+    PingAndSaveClicked,
     PongReceived(Result<Duration, String>),
+    PingAndSaved(Result<Duration, String>, EndpointTicket),
 }
 
 impl IcedIrohApp {
@@ -71,6 +79,10 @@ impl IcedIrohApp {
         match message {
             Message::Receiver(message) => self.update_receiver(message),
             Message::Sender(message) => self.update_sender(message),
+            Message::SidebarRowSelected(row) => {
+                self.sidebar_selected = Some(row);
+                Task::none()
+            }
         }
     }
 
@@ -86,8 +98,30 @@ impl IcedIrohApp {
         match message {
             SenderMessage::InputChanged(text) => self.on_input_changed(text),
             SenderMessage::SendClicked => self.on_send_clicked(),
+            SenderMessage::PingAndSaveClicked => self.on_ping_and_save_clicked(),
             SenderMessage::PongReceived(res) => self.on_pong_received(res),
+            SenderMessage::PingAndSaved(res, ticket) => self.on_ping_and_saved(res, ticket),
         }
+    }
+
+    fn on_ping_and_saved(
+        &mut self,
+        res: Result<Duration, String>,
+        ticket: EndpointTicket,
+    ) -> Task<Message> {
+        if res.is_err() {
+            return self.on_pong_received(res);
+        }
+
+        let id = ticket.endpoint_addr().id;
+        let already_saved = self.peers.iter().any(|p| p.endpoint_addr().id == id);
+        if already_saved {
+            self.pong_output = format!("err: endpoint {id} is already a peer");
+            return Task::none();
+        }
+
+        self.peers.push(ticket);
+        self.on_pong_received(res)
     }
 
     fn on_receiver_started(&mut self, res: Result<Arc<Router>, String>) -> Task<Message> {
@@ -119,22 +153,41 @@ impl IcedIrohApp {
     }
 
     fn on_send_clicked(&mut self) -> Task<Message> {
+        let ticket = match self.sidebar_selected {
+            Some(i) if i >= 2 => self.peers.get(i - 2).cloned(),
+            _ => self.decode_input_ticket(),
+        };
+
+        match ticket {
+            Some(ticket) => self.send_ping(ticket, false),
+            None => Task::none(),
+        }
+    }
+
+    fn on_ping_and_save_clicked(&mut self) -> Task<Message> {
+        match self.decode_input_ticket() {
+            Some(ticket) => self.send_ping(ticket, true),
+            None => Task::none(),
+        }
+    }
+
+    fn decode_input_ticket(&mut self) -> Option<EndpointTicket> {
         match EndpointTicket::decode_string(&self.sender_input) {
-            Ok(ticket) => self.send_ping(ticket),
+            Ok(ticket) => Some(ticket),
             Err(e) => {
                 self.pong_output = format!("failed to parse ticket: {e}");
-                Task::none()
+                None
             }
         }
     }
 
-    fn send_ping(&self, ticket: EndpointTicket) -> Task<Message> {
+    fn send_ping(&self, ticket: EndpointTicket, save: bool) -> Task<Message> {
         match &self.receiver_state {
             ReceiverState::Ready(router, _) => {
                 let send_ep = router.endpoint().clone();
 
-                Task::perform(run_sender(send_ep, ticket), |res| {
-                    SenderMessage::PongReceived(res.map_err(|e| e.to_string())).into()
+                Task::perform(run_sender(send_ep, ticket.clone()), move |res| {
+                    ping_result_message(res.map_err(|e| e.to_string()), ticket, save)
                 })
             }
             _ => Task::none(),
@@ -158,24 +211,80 @@ impl IcedIrohApp {
     }
 
     fn view(&self) -> impl Widget<Message> {
-        let body_receiver = self.receiver_view();
-
-        if matches!(self.receiver_state, ReceiverState::Ready(_, _)) {
-            let body_sender = column![
-                text_input("Enter ticket", &self.sender_input)
-                    .on_input(|text| SenderMessage::InputChanged(text).into())
-                    .multiline(Some(Wrapping::WordOrGlyph))
-                    .width(480),
-                button("Send").on_press(SenderMessage::SendClicked.into()),
-                text(&self.pong_output)
-            ]
-            .spacing(10)
-            .align_x(Horizontal::Center);
-
-            center_y(center_x(column![body_receiver, body_sender].spacing(10)))
-        } else {
-            center_y(center_x(column![body_receiver]))
+        let mut sidebar_rows = column![
+            radio("This endpoint", 0, self.sidebar_selected, Message::SidebarRowSelected)
+                .width(Length::Fill),
+            radio("Add peer", 1, self.sidebar_selected, Message::SidebarRowSelected)
+                .width(Length::Fill),
+        ];
+        for (i, peer) in self.peers.iter().enumerate() {
+            let id = peer.endpoint_addr().id.to_string();
+            let prefix = &id[..id.len().min(8)];
+            sidebar_rows = sidebar_rows.push(
+                radio(
+                    format!("Peer {prefix}..."),
+                    i + 2,
+                    self.sidebar_selected,
+                    Message::SidebarRowSelected,
+                )
+                .width(Length::Fill)
+                .boxed(),
+            );
         }
+
+        let sidebar = container(sidebar_rows.spacing(5).width(Length::Fill))
+        .width(200)
+        .height(Length::Fill)
+        .padding(10)
+        .style(|theme: &Theme| {
+            let tint = theme.palette().primary.base.color;
+            container::Style {
+                background: Some(Color { a: 0.08, ..tint }.into()),
+                ..Default::default()
+            }
+        });
+
+        let content = container(self.content_view())
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        row![sidebar, content]
+            .width(Length::Fill)
+            .height(Length::Fill)
+    }
+
+    fn content_view(&self) -> impl Widget<Message> {
+        let body = match self.sidebar_selected {
+            Some(0) | None => self.receiver_view(),
+            Some(1) => self.sender_view("Ping and Save", SenderMessage::PingAndSaveClicked.into()),
+            Some(_) => self.peer_view(),
+        };
+
+        center_y(center_x(body))
+    }
+
+    fn peer_view(&self) -> Element<'_, Message> {
+        column![
+            button("Send").on_press(SenderMessage::SendClicked.into()),
+            text(&self.pong_output)
+        ]
+        .spacing(10)
+        .align_x(Horizontal::Center)
+        .boxed()
+    }
+
+    fn sender_view(&self, button_label: &'static str, on_press: Message) -> Element<'_, Message> {
+        column![
+            text_input("Enter ticket", &self.sender_input)
+                .on_input(|text| SenderMessage::InputChanged(text).into())
+                .multiline(Some(Wrapping::WordOrGlyph))
+                .width(480),
+            button(button_label).on_press(on_press),
+            text(&self.pong_output)
+        ]
+        .spacing(10)
+        .align_x(Horizontal::Center)
+        .boxed()
     }
 
     fn receiver_view(&self) -> Element<'_, Message> {
@@ -196,6 +305,18 @@ impl IcedIrohApp {
         .spacing(10)
         .align_x(Horizontal::Center)
         .boxed()
+    }
+}
+
+fn ping_result_message(
+    res: Result<Duration, String>,
+    ticket: EndpointTicket,
+    save: bool,
+) -> Message {
+    if save {
+        SenderMessage::PingAndSaved(res, ticket).into()
+    } else {
+        SenderMessage::PongReceived(res).into()
     }
 }
 
