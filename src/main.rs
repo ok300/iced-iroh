@@ -155,23 +155,28 @@ impl IcedIrohApp {
     }
 
     fn on_send_clicked(&mut self) -> Task<Message> {
-        let ticket = match self.menu_selected {
-            Some(i) if i >= 2 => match self.peers.get(i - 2) {
-                Some(ticket) => Some(ticket.clone()),
-                None => {
-                    self.pong_output = format!(
-                        "err: selected peer {i} is out of range ({} peer(s) known)",
-                        self.peers.len()
-                    );
-                    None
-                }
-            },
-            _ => None,
-        };
+        match self.peer_ticket_for_selected_row() {
+            Ok(Some(ticket)) => self.send_ping(ticket, false),
+            Ok(None) => Task::none(),
+            Err(err) => {
+                self.pong_output = err;
+                Task::none()
+            }
+        }
+    }
 
-        match ticket {
-            Some(ticket) => self.send_ping(ticket, false),
-            None => Task::none(),
+    /// Maps the selected sidebar row to a saved peer ticket.
+    /// Rows 0 and 1 are the built-in views; peer rows start at index 2.
+    fn peer_ticket_for_selected_row(&self) -> Result<Option<EndpointTicket>, String> {
+        match self.menu_selected {
+            Some(i) if i >= 2 => match self.peers.get(i - 2) {
+                Some(ticket) => Ok(Some(ticket.clone())),
+                None => Err(format!(
+                    "err: selected peer {i} is out of range ({} peer(s) known)",
+                    self.peers.len()
+                )),
+            },
+            _ => Ok(None),
         }
     }
 
@@ -355,6 +360,7 @@ async fn run_sender(own_endpoint: Endpoint, ticket: EndpointTicket) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::{EndpointAddr, SecretKey};
 
     #[test]
     fn input_changed_updates_sender_input() {
@@ -473,5 +479,159 @@ mod tests {
             ..Default::default()
         };
         let _ = app.view();
+    }
+
+    fn test_ticket(byte: u8) -> EndpointTicket {
+        let secret = SecretKey::from_bytes(&[byte; 32]);
+        EndpointTicket::new(EndpointAddr::new(secret.public()))
+    }
+
+    #[test]
+    fn ping_and_saved_saves_new_peer_and_reports_rtt() {
+        let mut app = IcedIrohApp::default();
+        let ticket = test_ticket(1);
+
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(7)), ticket.clone()).into(),
+        );
+
+        assert_eq!(app.peers.len(), 1);
+        assert_eq!(app.peers[0].endpoint_addr().id, ticket.endpoint_addr().id);
+        assert_eq!(app.pong_output, "ping took: 7ms to complete");
+    }
+
+    #[test]
+    fn ping_and_saved_saves_distinct_peers() {
+        let mut app = IcedIrohApp::default();
+
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(1)), test_ticket(1)).into(),
+        );
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(2)), test_ticket(2)).into(),
+        );
+
+        assert_eq!(app.peers.len(), 2);
+    }
+
+    #[test]
+    fn ping_and_saved_with_already_saved_id_is_deduped() {
+        let mut app = IcedIrohApp::default();
+        let ticket = test_ticket(1);
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(7)), ticket.clone()).into(),
+        );
+        assert_eq!(app.peers.len(), 1);
+
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(9)), ticket.clone()).into(),
+        );
+
+        let id = ticket.endpoint_addr().id;
+        assert_eq!(app.peers.len(), 1, "duplicate peer must not be saved");
+        assert_eq!(
+            app.pong_output,
+            format!("err: endpoint {id} is already a peer")
+        );
+    }
+
+    #[test]
+    fn ping_and_saved_with_error_does_not_save_peer() {
+        let mut app = IcedIrohApp::default();
+
+        let _ = app.update(SenderMessage::PingAndSaved(Err("boom".into()), test_ticket(1)).into());
+
+        assert!(app.peers.is_empty());
+        assert_eq!(app.pong_output, "err: boom");
+    }
+
+    #[test]
+    fn ping_result_message_routes_on_save_flag() {
+        let ticket = test_ticket(1);
+
+        assert!(matches!(
+            ping_result_message(Ok(Duration::from_millis(1)), ticket.clone(), true),
+            Message::Sender(SenderMessage::PingAndSaved(Ok(_), _))
+        ));
+        assert!(matches!(
+            ping_result_message(Ok(Duration::from_millis(1)), ticket, false),
+            Message::Sender(SenderMessage::PongReceived(Ok(_)))
+        ));
+    }
+
+    #[test]
+    fn sidebar_peer_row_selected_sets_menu_and_clears_pong_output() {
+        let mut app = IcedIrohApp::default();
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(7)), test_ticket(1)).into(),
+        );
+        assert!(!app.pong_output.is_empty());
+
+        let _ = app.update(Message::MenuSelected(2));
+
+        assert_eq!(app.menu_selected, Some(2));
+        assert_eq!(app.pong_output, "");
+    }
+
+    #[test]
+    fn peer_ticket_for_selected_row_returns_saved_peer() {
+        let mut app = IcedIrohApp::default();
+        let t1 = test_ticket(1);
+        let t2 = test_ticket(2);
+        app.peers.push(t1.clone());
+        app.peers.push(t2.clone());
+
+        for (row, expected) in [(2usize, &t1), (3, &t2)] {
+            let _ = app.update(Message::MenuSelected(row));
+            let found = app.peer_ticket_for_selected_row().ok().flatten();
+            assert_eq!(
+                found.map(|t| t.endpoint_addr().id),
+                Some(expected.endpoint_addr().id),
+                "row {row} must map to its peer ticket"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_ticket_for_selected_row_returns_none_for_builtin_rows() {
+        let mut app = IcedIrohApp::default();
+        app.peers.push(test_ticket(1));
+
+        for row in [0, 1] {
+            let _ = app.update(Message::MenuSelected(row));
+            assert!(matches!(app.peer_ticket_for_selected_row(), Ok(None)));
+        }
+
+        app.menu_selected = None;
+        assert!(matches!(app.peer_ticket_for_selected_row(), Ok(None)));
+    }
+
+    #[test]
+    fn peer_ticket_for_selected_row_errors_when_peer_index_out_of_range() {
+        let mut app = IcedIrohApp::default();
+        app.peers.push(test_ticket(1));
+
+        let _ = app.update(Message::MenuSelected(3));
+
+        match app.peer_ticket_for_selected_row() {
+            Err(err) => {
+                assert!(err.contains("out of range"));
+                assert!(err.contains("1 peer(s) known"));
+            }
+            Ok(_) => panic!("row 3 has no saved peer"),
+        }
+    }
+
+    #[test]
+    fn send_clicked_with_valid_peer_row_does_not_report_lookup_error() {
+        let mut app = IcedIrohApp::default();
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(7)), test_ticket(1)).into(),
+        );
+        let _ = app.update(Message::MenuSelected(2));
+
+        let _ = app.update(SenderMessage::SendClicked.into());
+
+        assert_eq!(app.pong_output, "");
     }
 }
