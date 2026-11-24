@@ -156,7 +156,16 @@ impl IcedIrohApp {
 
     fn on_send_clicked(&mut self) -> Task<Message> {
         let ticket = match self.sidebar_selected {
-            Some(i) if i >= 2 => self.peers.get(i - 2).cloned(),
+            Some(i) if i >= 2 => match self.peers.get(i - 2) {
+                Some(ticket) => Some(ticket.clone()),
+                None => {
+                    self.pong_output = format!(
+                        "err: selected peer {i} is out of range ({} peer(s) known)",
+                        self.peers.len()
+                    );
+                    None
+                }
+            },
             _ => self.decode_input_ticket(),
         };
 
@@ -388,6 +397,16 @@ mod tests {
         let _ = app.update(SenderMessage::SendClicked.into());
 
         assert!(app.pong_output.contains("failed to parse ticket"));
+    }
+
+    #[test]
+    fn send_clicked_with_out_of_range_peer_index_reports_error() {
+        let mut app = IcedIrohApp::default();
+        let _ = app.update(Message::SidebarRowSelected(5));
+
+        let _ = app.update(SenderMessage::SendClicked.into());
+
+        assert!(app.pong_output.contains("out of range"));
     }
 
     #[test]
