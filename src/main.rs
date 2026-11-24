@@ -1,10 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
 use iced::{
-    Element, Task, Widget,
+    Color, Element, Length, Task, Theme, Widget,
     alignment::Horizontal,
     clipboard,
-    widget::{button, center_x, center_y, column, text, text_input},
+    widget::{button, center_x, center_y, column, container, radio, row, text, text_input},
 };
 use iced_core::text::Wrapping;
 use iroh::{Endpoint, endpoint::presets, protocol::Router};
@@ -17,7 +17,10 @@ fn main() -> iced::Result {
     iced::application(
         || {
             (
-                IcedIrohApp::default(),
+                IcedIrohApp {
+                    menu_selected: Some(0),
+                    ..Default::default()
+                },
                 Task::perform(run_receiver(), |res| {
                     ReceiverMessage::ReceiverStarted(res.map_err(|e| e.to_string())).into()
                 }),
@@ -35,6 +38,8 @@ struct IcedIrohApp {
     ticket_copied: bool,
     sender_input: String,
     pong_output: String,
+    menu_selected: Option<usize>,
+    peers: Vec<EndpointTicket>,
 }
 
 #[derive(Default)]
@@ -50,6 +55,7 @@ enum ReceiverState {
 enum Message {
     Sender(SenderMessage),
     Receiver(ReceiverMessage),
+    MenuSelected(usize),
 }
 
 #[derive(Clone)]
@@ -63,7 +69,9 @@ enum ReceiverMessage {
 enum SenderMessage {
     InputChanged(String),
     SendClicked,
+    PingAndSaveClicked,
     PongReceived(Result<Duration, String>),
+    PingAndSaved(Result<Duration, String>, EndpointTicket),
 }
 
 impl IcedIrohApp {
@@ -71,6 +79,12 @@ impl IcedIrohApp {
         match message {
             Message::Receiver(message) => self.update_receiver(message),
             Message::Sender(message) => self.update_sender(message),
+            Message::MenuSelected(row) => {
+                self.menu_selected = Some(row);
+                // Clear stale output so results from a previous view don't linger.
+                self.pong_output.clear();
+                Task::none()
+            }
         }
     }
 
@@ -86,8 +100,30 @@ impl IcedIrohApp {
         match message {
             SenderMessage::InputChanged(text) => self.on_input_changed(text),
             SenderMessage::SendClicked => self.on_send_clicked(),
+            SenderMessage::PingAndSaveClicked => self.on_ping_and_save_clicked(),
             SenderMessage::PongReceived(res) => self.on_pong_received(res),
+            SenderMessage::PingAndSaved(res, ticket) => self.on_ping_and_saved(res, ticket),
         }
+    }
+
+    fn on_ping_and_saved(
+        &mut self,
+        res: Result<Duration, String>,
+        ticket: EndpointTicket,
+    ) -> Task<Message> {
+        if res.is_err() {
+            return self.on_pong_received(res);
+        }
+
+        let id = ticket.endpoint_addr().id;
+        let already_saved = self.peers.iter().any(|p| p.endpoint_addr().id == id);
+        if already_saved {
+            self.pong_output = format!("err: endpoint {id} is already a peer");
+            return Task::none();
+        }
+
+        self.peers.push(ticket);
+        self.on_pong_received(res)
     }
 
     fn on_receiver_started(&mut self, res: Result<Arc<Router>, String>) -> Task<Message> {
@@ -119,22 +155,55 @@ impl IcedIrohApp {
     }
 
     fn on_send_clicked(&mut self) -> Task<Message> {
-        match EndpointTicket::decode_string(&self.sender_input) {
-            Ok(ticket) => self.send_ping(ticket),
-            Err(e) => {
-                self.pong_output = format!("failed to parse ticket: {e}");
+        match self.peer_ticket_for_selected_row() {
+            Ok(Some(ticket)) => self.send_ping(ticket, false),
+            Ok(None) => Task::none(),
+            Err(err) => {
+                self.pong_output = err;
                 Task::none()
             }
         }
     }
 
-    fn send_ping(&self, ticket: EndpointTicket) -> Task<Message> {
+    /// Maps the selected sidebar row to a saved peer ticket.
+    /// Rows 0 and 1 are the built-in views; peer rows start at index 2.
+    fn peer_ticket_for_selected_row(&self) -> Result<Option<EndpointTicket>, String> {
+        match self.menu_selected {
+            Some(i) if i >= 2 => match self.peers.get(i - 2) {
+                Some(ticket) => Ok(Some(ticket.clone())),
+                None => Err(format!(
+                    "err: selected peer {i} is out of range ({} peer(s) known)",
+                    self.peers.len()
+                )),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    fn on_ping_and_save_clicked(&mut self) -> Task<Message> {
+        match self.decode_input_ticket() {
+            Some(ticket) => self.send_ping(ticket, true),
+            None => Task::none(),
+        }
+    }
+
+    fn decode_input_ticket(&mut self) -> Option<EndpointTicket> {
+        match EndpointTicket::decode_string(&self.sender_input) {
+            Ok(ticket) => Some(ticket),
+            Err(e) => {
+                self.pong_output = format!("failed to parse ticket: {e}");
+                None
+            }
+        }
+    }
+
+    fn send_ping(&self, ticket: EndpointTicket, save: bool) -> Task<Message> {
         match &self.receiver_state {
             ReceiverState::Ready(router, _) => {
                 let send_ep = router.endpoint().clone();
 
-                Task::perform(run_sender(send_ep, ticket), |res| {
-                    SenderMessage::PongReceived(res.map_err(|e| e.to_string())).into()
+                Task::perform(run_sender(send_ep, ticket.clone()), move |res| {
+                    ping_result_message(res.map_err(|e| e.to_string()), ticket, save)
                 })
             }
             _ => Task::none(),
@@ -158,24 +227,74 @@ impl IcedIrohApp {
     }
 
     fn view(&self) -> impl Widget<Message> {
-        let body_receiver = self.receiver_view();
-
-        if matches!(self.receiver_state, ReceiverState::Ready(_, _)) {
-            let body_sender = column![
-                text_input("Enter ticket", &self.sender_input)
-                    .on_input(|text| SenderMessage::InputChanged(text).into())
-                    .multiline(Some(Wrapping::WordOrGlyph))
-                    .width(480),
-                button("Send").on_press(SenderMessage::SendClicked.into()),
-                text(&self.pong_output)
-            ]
-            .spacing(10)
-            .align_x(Horizontal::Center);
-
-            center_y(center_x(column![body_receiver, body_sender].spacing(10)))
-        } else {
-            center_y(center_x(column![body_receiver]))
+        let mut sidebar_rows = column![
+            radio("This peer", 0, self.menu_selected, Message::MenuSelected).width(Length::Fill),
+            radio("Add peer", 1, self.menu_selected, Message::MenuSelected).width(Length::Fill),
+        ];
+        for (i, peer) in self.peers.iter().enumerate() {
+            let id = peer.endpoint_addr().id.to_string();
+            let prefix = id.get(..8).unwrap_or(&id);
+            let peer_label = format!("Peer {prefix}...");
+            sidebar_rows = sidebar_rows.push(
+                radio(peer_label, i + 2, self.menu_selected, Message::MenuSelected)
+                    .width(Length::Fill)
+                    .boxed(),
+            );
         }
+
+        let sidebar = container(sidebar_rows.spacing(5).width(Length::Fill))
+            .width(200)
+            .height(Length::Fill)
+            .padding(10)
+            .style(|theme: &Theme| {
+                let tint = theme.palette().primary.base.color;
+                container::Style {
+                    background: Some(Color { a: 0.08, ..tint }.into()),
+                    ..Default::default()
+                }
+            });
+
+        let content = container(self.content_view())
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        row![sidebar, content]
+            .width(Length::Fill)
+            .height(Length::Fill)
+    }
+
+    fn content_view(&self) -> impl Widget<Message> {
+        let body = match self.menu_selected {
+            Some(0) | None => self.receiver_view(),
+            Some(1) => self.sender_view("Ping and Save", SenderMessage::PingAndSaveClicked.into()),
+            Some(_) => self.peer_view(),
+        };
+
+        center_y(center_x(body))
+    }
+
+    fn peer_view(&self) -> Element<'_, Message> {
+        column![
+            button("Send").on_press(SenderMessage::SendClicked.into()),
+            text(&self.pong_output)
+        ]
+        .spacing(10)
+        .align_x(Horizontal::Center)
+        .boxed()
+    }
+
+    fn sender_view(&self, button_label: &'static str, on_press: Message) -> Element<'_, Message> {
+        column![
+            text_input("Enter ticket", &self.sender_input)
+                .on_input(|text| SenderMessage::InputChanged(text).into())
+                .multiline(Some(Wrapping::WordOrGlyph))
+                .width(480),
+            button(button_label).on_press(on_press),
+            text(&self.pong_output)
+        ]
+        .spacing(10)
+        .align_x(Horizontal::Center)
+        .boxed()
     }
 
     fn receiver_view(&self) -> Element<'_, Message> {
@@ -196,6 +315,18 @@ impl IcedIrohApp {
         .spacing(10)
         .align_x(Horizontal::Center)
         .boxed()
+    }
+}
+
+fn ping_result_message(
+    res: Result<Duration, String>,
+    ticket: EndpointTicket,
+    save: bool,
+) -> Message {
+    if save {
+        SenderMessage::PingAndSaved(res, ticket).into()
+    } else {
+        SenderMessage::PongReceived(res).into()
     }
 }
 
@@ -229,6 +360,7 @@ async fn run_sender(own_endpoint: Endpoint, ticket: EndpointTicket) -> anyhow::R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::{EndpointAddr, SecretKey};
 
     #[test]
     fn input_changed_updates_sender_input() {
@@ -258,13 +390,23 @@ mod tests {
     }
 
     #[test]
-    fn send_clicked_with_invalid_ticket_reports_error() {
+    fn ping_and_save_clicked_with_invalid_ticket_reports_error() {
         let mut app = IcedIrohApp::default();
         let _ = app.update(SenderMessage::InputChanged("not-a-ticket".into()).into());
 
-        let _ = app.update(SenderMessage::SendClicked.into());
+        let _ = app.update(SenderMessage::PingAndSaveClicked.into());
 
         assert!(app.pong_output.contains("failed to parse ticket"));
+    }
+
+    #[test]
+    fn send_clicked_with_out_of_range_peer_index_reports_error() {
+        let mut app = IcedIrohApp::default();
+        let _ = app.update(Message::MenuSelected(5));
+
+        let _ = app.update(SenderMessage::SendClicked.into());
+
+        assert!(app.pong_output.contains("out of range"));
     }
 
     #[test]
@@ -284,9 +426,7 @@ mod tests {
 
         let _ = app.update(ReceiverMessage::ReceiverStarted(Err("fail".into())).into());
 
-        assert!(
-            matches!(&app.receiver_state, ReceiverState::Error(err) if err == "fail")
-        );
+        assert!(matches!(&app.receiver_state, ReceiverState::Error(err) if err == "fail"));
     }
 
     #[test]
@@ -318,6 +458,18 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_row_selected_clears_pong_output() {
+        let mut app = IcedIrohApp::default();
+        let _ = app.update(SenderMessage::PongReceived(Ok(Duration::from_millis(42))).into());
+        assert!(!app.pong_output.is_empty());
+
+        let _ = app.update(Message::MenuSelected(1));
+
+        assert_eq!(app.menu_selected, Some(1));
+        assert_eq!(app.pong_output, "");
+    }
+
+    #[test]
     fn view_builds_in_loading_and_error_states() {
         let app = IcedIrohApp::default();
         let _ = app.view();
@@ -327,5 +479,159 @@ mod tests {
             ..Default::default()
         };
         let _ = app.view();
+    }
+
+    fn test_ticket(byte: u8) -> EndpointTicket {
+        let secret = SecretKey::from_bytes(&[byte; 32]);
+        EndpointTicket::new(EndpointAddr::new(secret.public()))
+    }
+
+    #[test]
+    fn ping_and_saved_saves_new_peer_and_reports_rtt() {
+        let mut app = IcedIrohApp::default();
+        let ticket = test_ticket(1);
+
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(7)), ticket.clone()).into(),
+        );
+
+        assert_eq!(app.peers.len(), 1);
+        assert_eq!(app.peers[0].endpoint_addr().id, ticket.endpoint_addr().id);
+        assert_eq!(app.pong_output, "ping took: 7ms to complete");
+    }
+
+    #[test]
+    fn ping_and_saved_saves_distinct_peers() {
+        let mut app = IcedIrohApp::default();
+
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(1)), test_ticket(1)).into(),
+        );
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(2)), test_ticket(2)).into(),
+        );
+
+        assert_eq!(app.peers.len(), 2);
+    }
+
+    #[test]
+    fn ping_and_saved_with_already_saved_id_is_deduped() {
+        let mut app = IcedIrohApp::default();
+        let ticket = test_ticket(1);
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(7)), ticket.clone()).into(),
+        );
+        assert_eq!(app.peers.len(), 1);
+
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(9)), ticket.clone()).into(),
+        );
+
+        let id = ticket.endpoint_addr().id;
+        assert_eq!(app.peers.len(), 1, "duplicate peer must not be saved");
+        assert_eq!(
+            app.pong_output,
+            format!("err: endpoint {id} is already a peer")
+        );
+    }
+
+    #[test]
+    fn ping_and_saved_with_error_does_not_save_peer() {
+        let mut app = IcedIrohApp::default();
+
+        let _ = app.update(SenderMessage::PingAndSaved(Err("boom".into()), test_ticket(1)).into());
+
+        assert!(app.peers.is_empty());
+        assert_eq!(app.pong_output, "err: boom");
+    }
+
+    #[test]
+    fn ping_result_message_routes_on_save_flag() {
+        let ticket = test_ticket(1);
+
+        assert!(matches!(
+            ping_result_message(Ok(Duration::from_millis(1)), ticket.clone(), true),
+            Message::Sender(SenderMessage::PingAndSaved(Ok(_), _))
+        ));
+        assert!(matches!(
+            ping_result_message(Ok(Duration::from_millis(1)), ticket, false),
+            Message::Sender(SenderMessage::PongReceived(Ok(_)))
+        ));
+    }
+
+    #[test]
+    fn sidebar_peer_row_selected_sets_menu_and_clears_pong_output() {
+        let mut app = IcedIrohApp::default();
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(7)), test_ticket(1)).into(),
+        );
+        assert!(!app.pong_output.is_empty());
+
+        let _ = app.update(Message::MenuSelected(2));
+
+        assert_eq!(app.menu_selected, Some(2));
+        assert_eq!(app.pong_output, "");
+    }
+
+    #[test]
+    fn peer_ticket_for_selected_row_returns_saved_peer() {
+        let mut app = IcedIrohApp::default();
+        let t1 = test_ticket(1);
+        let t2 = test_ticket(2);
+        app.peers.push(t1.clone());
+        app.peers.push(t2.clone());
+
+        for (row, expected) in [(2usize, &t1), (3, &t2)] {
+            let _ = app.update(Message::MenuSelected(row));
+            let found = app.peer_ticket_for_selected_row().ok().flatten();
+            assert_eq!(
+                found.map(|t| t.endpoint_addr().id),
+                Some(expected.endpoint_addr().id),
+                "row {row} must map to its peer ticket"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_ticket_for_selected_row_returns_none_for_builtin_rows() {
+        let mut app = IcedIrohApp::default();
+        app.peers.push(test_ticket(1));
+
+        for row in [0, 1] {
+            let _ = app.update(Message::MenuSelected(row));
+            assert!(matches!(app.peer_ticket_for_selected_row(), Ok(None)));
+        }
+
+        app.menu_selected = None;
+        assert!(matches!(app.peer_ticket_for_selected_row(), Ok(None)));
+    }
+
+    #[test]
+    fn peer_ticket_for_selected_row_errors_when_peer_index_out_of_range() {
+        let mut app = IcedIrohApp::default();
+        app.peers.push(test_ticket(1));
+
+        let _ = app.update(Message::MenuSelected(3));
+
+        match app.peer_ticket_for_selected_row() {
+            Err(err) => {
+                assert!(err.contains("out of range"));
+                assert!(err.contains("1 peer(s) known"));
+            }
+            Ok(_) => panic!("row 3 has no saved peer"),
+        }
+    }
+
+    #[test]
+    fn send_clicked_with_valid_peer_row_does_not_report_lookup_error() {
+        let mut app = IcedIrohApp::default();
+        let _ = app.update(
+            SenderMessage::PingAndSaved(Ok(Duration::from_millis(7)), test_ticket(1)).into(),
+        );
+        let _ = app.update(Message::MenuSelected(2));
+
+        let _ = app.update(SenderMessage::SendClicked.into());
+
+        assert_eq!(app.pong_output, "");
     }
 }
