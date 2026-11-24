@@ -18,7 +18,7 @@ fn main() -> iced::Result {
         || {
             (
                 IcedIrohApp {
-                    sidebar_selected: Some(0),
+                    menu_selected: Some(0),
                     ..Default::default()
                 },
                 Task::perform(run_receiver(), |res| {
@@ -38,7 +38,7 @@ struct IcedIrohApp {
     ticket_copied: bool,
     sender_input: String,
     pong_output: String,
-    sidebar_selected: Option<usize>,
+    menu_selected: Option<usize>,
     peers: Vec<EndpointTicket>,
 }
 
@@ -55,7 +55,7 @@ enum ReceiverState {
 enum Message {
     Sender(SenderMessage),
     Receiver(ReceiverMessage),
-    SidebarRowSelected(usize),
+    MenuSelected(usize),
 }
 
 #[derive(Clone)]
@@ -79,8 +79,8 @@ impl IcedIrohApp {
         match message {
             Message::Receiver(message) => self.update_receiver(message),
             Message::Sender(message) => self.update_sender(message),
-            Message::SidebarRowSelected(row) => {
-                self.sidebar_selected = Some(row);
+            Message::MenuSelected(row) => {
+                self.menu_selected = Some(row);
                 // Clear stale output so results from a previous view don't linger.
                 self.pong_output.clear();
                 Task::none()
@@ -155,7 +155,7 @@ impl IcedIrohApp {
     }
 
     fn on_send_clicked(&mut self) -> Task<Message> {
-        let ticket = match self.sidebar_selected {
+        let ticket = match self.menu_selected {
             Some(i) if i >= 2 => match self.peers.get(i - 2) {
                 Some(ticket) => Some(ticket.clone()),
                 None => {
@@ -223,37 +223,31 @@ impl IcedIrohApp {
 
     fn view(&self) -> impl Widget<Message> {
         let mut sidebar_rows = column![
-            radio("This endpoint", 0, self.sidebar_selected, Message::SidebarRowSelected)
-                .width(Length::Fill),
-            radio("Add peer", 1, self.sidebar_selected, Message::SidebarRowSelected)
-                .width(Length::Fill),
+            radio("This peer", 0, self.menu_selected, Message::MenuSelected).width(Length::Fill),
+            radio("Add peer", 1, self.menu_selected, Message::MenuSelected).width(Length::Fill),
         ];
         for (i, peer) in self.peers.iter().enumerate() {
             let id = peer.endpoint_addr().id.to_string();
             let prefix = id.get(..8).unwrap_or(&id);
+            let peer_label = format!("Peer {prefix}...");
             sidebar_rows = sidebar_rows.push(
-                radio(
-                    format!("Peer {prefix}..."),
-                    i + 2,
-                    self.sidebar_selected,
-                    Message::SidebarRowSelected,
-                )
-                .width(Length::Fill)
-                .boxed(),
+                radio(peer_label, i + 2, self.menu_selected, Message::MenuSelected)
+                    .width(Length::Fill)
+                    .boxed(),
             );
         }
 
         let sidebar = container(sidebar_rows.spacing(5).width(Length::Fill))
-        .width(200)
-        .height(Length::Fill)
-        .padding(10)
-        .style(|theme: &Theme| {
-            let tint = theme.palette().primary.base.color;
-            container::Style {
-                background: Some(Color { a: 0.08, ..tint }.into()),
-                ..Default::default()
-            }
-        });
+            .width(200)
+            .height(Length::Fill)
+            .padding(10)
+            .style(|theme: &Theme| {
+                let tint = theme.palette().primary.base.color;
+                container::Style {
+                    background: Some(Color { a: 0.08, ..tint }.into()),
+                    ..Default::default()
+                }
+            });
 
         let content = container(self.content_view())
             .width(Length::Fill)
@@ -265,7 +259,7 @@ impl IcedIrohApp {
     }
 
     fn content_view(&self) -> impl Widget<Message> {
-        let body = match self.sidebar_selected {
+        let body = match self.menu_selected {
             Some(0) | None => self.receiver_view(),
             Some(1) => self.sender_view("Ping and Save", SenderMessage::PingAndSaveClicked.into()),
             Some(_) => self.peer_view(),
@@ -402,7 +396,7 @@ mod tests {
     #[test]
     fn send_clicked_with_out_of_range_peer_index_reports_error() {
         let mut app = IcedIrohApp::default();
-        let _ = app.update(Message::SidebarRowSelected(5));
+        let _ = app.update(Message::MenuSelected(5));
 
         let _ = app.update(SenderMessage::SendClicked.into());
 
@@ -426,9 +420,7 @@ mod tests {
 
         let _ = app.update(ReceiverMessage::ReceiverStarted(Err("fail".into())).into());
 
-        assert!(
-            matches!(&app.receiver_state, ReceiverState::Error(err) if err == "fail")
-        );
+        assert!(matches!(&app.receiver_state, ReceiverState::Error(err) if err == "fail"));
     }
 
     #[test]
@@ -465,9 +457,9 @@ mod tests {
         let _ = app.update(SenderMessage::PongReceived(Ok(Duration::from_millis(42))).into());
         assert!(!app.pong_output.is_empty());
 
-        let _ = app.update(Message::SidebarRowSelected(1));
+        let _ = app.update(Message::MenuSelected(1));
 
-        assert_eq!(app.sidebar_selected, Some(1));
+        assert_eq!(app.menu_selected, Some(1));
         assert_eq!(app.pong_output, "");
     }
 
