@@ -81,6 +81,8 @@ impl IcedIrohApp {
             Message::Sender(message) => self.update_sender(message),
             Message::SidebarRowSelected(row) => {
                 self.sidebar_selected = Some(row);
+                // Clear stale output so results from a previous view don't linger.
+                self.pong_output.clear();
                 Task::none()
             }
         }
@@ -436,6 +438,18 @@ mod tests {
             ticket_copied_message(Err(clipboard::Error::ClipboardUnavailable)),
             Message::Receiver(ReceiverMessage::TicketCopied(Err(_)))
         ));
+    }
+
+    #[test]
+    fn sidebar_row_selected_clears_pong_output() {
+        let mut app = IcedIrohApp::default();
+        let _ = app.update(SenderMessage::PongReceived(Ok(Duration::from_millis(42))).into());
+        assert!(!app.pong_output.is_empty());
+
+        let _ = app.update(Message::SidebarRowSelected(1));
+
+        assert_eq!(app.sidebar_selected, Some(1));
+        assert_eq!(app.pong_output, "");
     }
 
     #[test]
