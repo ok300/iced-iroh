@@ -230,7 +230,7 @@ impl IcedIrohApp {
         ];
         for (i, peer) in self.peers.iter().enumerate() {
             let id = peer.endpoint_addr().id.to_string();
-            let prefix = &id[..id.len().min(8)];
+            let prefix = id.get(..8).unwrap_or(&id);
             sidebar_rows = sidebar_rows.push(
                 radio(
                     format!("Peer {prefix}..."),
