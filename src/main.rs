@@ -166,7 +166,7 @@ impl IcedIrohApp {
                     None
                 }
             },
-            _ => self.decode_input_ticket(),
+            _ => None,
         };
 
         match ticket {
@@ -390,11 +390,11 @@ mod tests {
     }
 
     #[test]
-    fn send_clicked_with_invalid_ticket_reports_error() {
+    fn ping_and_save_clicked_with_invalid_ticket_reports_error() {
         let mut app = IcedIrohApp::default();
         let _ = app.update(SenderMessage::InputChanged("not-a-ticket".into()).into());
 
-        let _ = app.update(SenderMessage::SendClicked.into());
+        let _ = app.update(SenderMessage::PingAndSaveClicked.into());
 
         assert!(app.pong_output.contains("failed to parse ticket"));
     }
